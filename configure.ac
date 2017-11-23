@@ -55,7 +55,7 @@ if test "x${have_lstat}" = "xyes" ; then
   AC_DEFINE([HAVE_LSTAT], 1, [Define if lstat syscall is supported])
 fi
 
-AS_COMPILER_FLAGS(GLOBAL_CFLAGS, "-Wall -Wextra -Wmissing-declarations -Wredundant-decls -Wshadow -Wpointer-arith  -Wwrite-strings -Wswitch-default -Wno-unused-parameter -Werror -g")
+AS_COMPILER_FLAGS(GLOBAL_CFLAGS, "-Wall -Wextra -Wmissing-declarations -Wredundant-decls -Wshadow -Wpointer-arith  -Wwrite-strings -Wswitch-default -g")
 AC_SUBST(GLOBAL_CFLAGS)
 
 m4_ifdef([AM_SILENT_RULES],[AM_SILENT_RULES([yes])])
