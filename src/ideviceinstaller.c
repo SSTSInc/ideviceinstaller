@@ -180,7 +180,7 @@ static void status_cb(plist_t command, plist_t status, void *unused)
 					print_apps(current_list);
 					plist_free(current_list);
 				}
-			} else {
+			} else if (status_name){
 				/* get progress if any */
 				int percent = -1;
 				instproxy_status_get_percent_complete(status, &percent);
@@ -907,7 +907,7 @@ run_again:
 					dstpath = NULL;
 
 					zip_uint64_t zfsize = 0;
-					while (zfsize < zs.size) {
+					while (zfsize < (zip_uint64_t)zs.size) {
 						zip_int64_t amount = zip_fread(zfile, buf, sizeof(buf));
 						if (amount == 0) {
 							break;
