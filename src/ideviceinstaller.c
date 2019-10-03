@@ -1,8 +1,8 @@
 /*
  * ideviceinstaller - Manage apps on iOS devices.
  *
+ * Copyright (C) 2010-2019 Nikias Bassen <nikias@gmx.li>
  * Copyright (C) 2010-2015 Martin Szulecki <m.szulecki@libimobiledevice.org>
- * Copyright (C) 2010-2014 Nikias Bassen <nikias@gmx.li>
  *
  * Licensed under the GNU General Public License Version 2
  *
@@ -40,6 +40,9 @@
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
 #endif
+#ifndef WIN32
+#include <signal.h>
+#endif
 
 #include <libimobiledevice/libimobiledevice.h>
 #include <libimobiledevice/lockdown.h>
@@ -51,11 +54,37 @@
 
 #include <zip.h>
 
-#ifndef ZIP_CODEC_ENCODE
-// this is required for old libzip...
-#define zip_get_num_entries(x, y) zip_get_num_files(x)
-#define zip_int64_t ssize_t
-#define zip_uint64_t off_t
+#ifdef WIN32
+#include <windows.h>
+#define wait_ms(x) Sleep(x)
+#else
+#define wait_ms(x) { struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = x * 1000000; nanosleep(&ts, NULL); }
+#endif
+
+#ifndef HAVE_VASPRINTF
+static int vasprintf(char **PTR, const char *TEMPLATE, va_list AP)
+{
+	int res;
+	char buf[16];
+	res = vsnprintf(buf, 16, TEMPLATE, AP);
+	if (res > 0) {
+		*PTR = (char*)malloc(res+1);
+		res = vsnprintf(*PTR, res+1, TEMPLATE, AP);
+	}
+	return res;
+}
+#endif
+
+#ifndef HAVE_ASPRINTF
+static int asprintf(char **PTR, const char *TEMPLATE, ...)
+{
+	int res;
+	va_list AP;
+	va_start(AP, TEMPLATE);
+	res = vasprintf(PTR, TEMPLATE, AP);
+	va_end(AP);
+	return res;
+}
 #endif
 
 #define ITUNES_METADATA_PLIST_FILENAME "iTunesMetadata.plist"
@@ -83,6 +112,7 @@ int cmd = CMD_NONE;
 
 char *last_status = NULL;
 int wait_for_command_complete = 0;
+int use_notifier = 0;
 int notification_expected = 0;
 int is_device_connected = 0;
 int command_completed = 0;
@@ -180,19 +210,22 @@ static void status_cb(plist_t command, plist_t status, void *unused)
 					print_apps(current_list);
 					plist_free(current_list);
 				}
-			} else if (status_name){
+			} else if (status_name) {
 				/* get progress if any */
 				int percent = -1;
 				instproxy_status_get_percent_complete(status, &percent);
 
 				if (last_status && (strcmp(last_status, status_name))) {
-					printf("\r");
+					printf("\n");
 				}
 
 				if (percent >= 0) {
-					printf("%s: %s (%d%%)\n", command_name, status_name, percent);
+					printf("\r%s: %s (%d%%)", command_name, status_name, percent);
 				} else {
-					printf("%s: %s\n", command_name, status_name);
+					printf("\r%s: %s", command_name, status_name);
+				}
+				if (command_completed) {
+					printf("\n");
 				}
 			}
 		} else {
@@ -205,26 +238,14 @@ static void status_cb(plist_t command, plist_t status, void *unused)
 		}
 
 		/* clean up */
-		if (error_name)
-			free(error_name);
+		free(error_name);
+		free(error_description);
 
-		if (error_description)
-			free(error_description);
+		free(last_status);
+		last_status = status_name;
 
-		if (last_status) {
-			free(last_status);
-			last_status = NULL;
-		}
-
-		if (status_name) {
-			last_status = strdup(status_name);
-			free(status_name);
-		}
-
-		if (command_name) {
-			free(command_name);
-			command_name = NULL;
-		}
+		free(command_name);
+		command_name = NULL;
 	} else {
 		fprintf(stderr, "ERROR: %s was called with invalid arguments!\n", __func__);
 	}
@@ -307,7 +328,7 @@ static int zip_get_app_directory(struct zip* zf, char** path)
 
 				len = p - name + 1;
 
-				if (*path != NULL) {
+				if (path != NULL) {
 					free(*path);
 					*path = NULL;
 				}
@@ -330,15 +351,15 @@ static int zip_get_app_directory(struct zip* zf, char** path)
 static void idevice_event_callback(const idevice_event_t* event, void* userdata)
 {
 	if (event->event == IDEVICE_DEVICE_REMOVE) {
-		is_device_connected = 0;
+		if (!strcmp(udid, event->udid)) {
+			fprintf(stderr, "ideviceinstaller: Device removed\n");
+			is_device_connected = 0;
+		}
 	}
 }
 
 static void idevice_wait_for_command_to_complete()
 {
-	struct timespec ts;
-	ts.tv_sec = 0;
-	ts.tv_nsec = 50000000;
 	is_device_connected = 1;
 
 	/* subscribe to make sure to exit on device removal */
@@ -346,41 +367,16 @@ static void idevice_wait_for_command_to_complete()
 
 	/* wait for command to complete */
 	while (wait_for_command_complete && !command_completed && !err_occurred
-		   && !notified && is_device_connected) {
-		nanosleep(&ts, NULL);
+		   && is_device_connected) {
+		wait_ms(50);
 	}
 
 	/* wait some time if a notification is expected */
-	while (notification_expected && !notified && !err_occurred && is_device_connected) {
-		nanosleep(&ts, NULL);
+	while (use_notifier && notification_expected && !notified && !err_occurred && is_device_connected) {
+		wait_ms(50);
 	}
 
 	idevice_event_unsubscribe();
-}
-
-static int str_is_udid(const char* str)
-{
-	const char allowed[] = "0123456789abcdefABCDEF";
-
-	/* handle NULL case */
-	if (str == NULL)
-		return -1;
-
-	int length = strlen(str);
-
-	/* verify length */
-	if (length != 40)
-		return -1;
-
-	/* check for invalid characters */
-	while(length--) {
-		/* invalid character in udid? */
-		if (strchr(allowed, str[length]) == NULL) {
-			return -1;
-		}
-	}
-
-	return 0;
 }
 
 static void print_usage(int argc, char **argv)
@@ -391,7 +387,7 @@ static void print_usage(int argc, char **argv)
 	printf("Usage: %s OPTIONS\n", (name ? name + 1 : argv[0]));
 	printf("Manage apps on iOS devices.\n\n");
 	printf
-		("  -u, --udid UDID\tTarget specific device by its 40-digit device UDID.\n"
+		("  -u, --udid UDID\tTarget specific device by UDID.\n"
 		 "  -l, --list-apps\tList apps, possible options:\n"
 		 "       -o list_user\t- list user apps only (this is the default)\n"
 		 "       -o list_system\t- list system apps only\n"
@@ -412,6 +408,8 @@ static void print_usage(int argc, char **argv)
 		 "  -r, --restore APPID\tRestore archived app specified by APPID\n"
 		 "  -R, --remove-archive APPID  Remove app archive specified by APPID\n"
 		 "  -o, --options\t\tPass additional options to the specified command.\n"
+		 "  -n, --notify-wait\t\tWait for app installed/uninstalled notification\n"
+		 "                    \t\tto before reporting success of operation\n"
 		 "  -h, --help\t\tprints usage information\n"
 		 "  -d, --debug\t\tenable communication debugging\n" "\n");
 	printf("Homepage: <http://libimobiledevice.org>\n");
@@ -420,24 +418,25 @@ static void print_usage(int argc, char **argv)
 static void parse_opts(int argc, char **argv)
 {
 	static struct option longopts[] = {
-		{"help", 0, NULL, 'h'},
-		{"udid", 1, NULL, 'u'},
-		{"list-apps", 0, NULL, 'l'},
-		{"install", 1, NULL, 'i'},
-		{"uninstall", 1, NULL, 'U'},
-		{"upgrade", 1, NULL, 'g'},
-		{"list-archives", 0, NULL, 'L'},
-		{"archive", 1, NULL, 'a'},
-		{"restore", 1, NULL, 'r'},
-		{"remove-archive", 1, NULL, 'R'},
-		{"options", 1, NULL, 'o'},
-		{"debug", 0, NULL, 'd'},
-		{NULL, 0, NULL, 0}
+		{ "help", no_argument, NULL, 'h' },
+		{ "udid", required_argument, NULL, 'u' },
+		{ "list-apps", no_argument, NULL, 'l' },
+		{ "install", required_argument, NULL, 'i' },
+		{ "uninstall", required_argument, NULL, 'U' },
+		{ "upgrade", required_argument, NULL, 'g' },
+		{ "list-archives", no_argument, NULL, 'L' },
+		{ "archive", required_argument, NULL, 'a' },
+		{ "restore", required_argument, NULL, 'r' },
+		{ "remove-archive", required_argument, NULL, 'R' },
+		{ "options", required_argument, NULL, 'o' },
+		{ "notify-wait", no_argument, NULL, 'n' },
+		{ "debug", no_argument, NULL, 'd' },
+		{ NULL, 0, NULL, 0 }
 	};
 	int c;
 
 	while (1) {
-		c = getopt_long(argc, argv, "hU:li:u:g:La:r:R:o:d", longopts,
+		c = getopt_long(argc, argv, "hU:li:u:g:La:r:R:o:nd", longopts,
 						(int *) 0);
 		if (c == -1) {
 			break;
@@ -467,19 +466,12 @@ static void parse_opts(int argc, char **argv)
 			print_usage(argc, argv);
 			exit(0);
 		case 'u':
-			if (str_is_udid(optarg) == 0) {
-				udid = strdup(optarg);
-				break;
-			}
-			if (strchr(optarg, '.') != NULL) {
-				fprintf(stderr, "WARNING: Using \"-u\" for \"--uninstall\" is deprecated. Please use \"-U\" instead.\n");
-				cmd = CMD_UNINSTALL;
-				appid = strdup(optarg);
-			} else {
-				printf("ERROR: Invalid UDID specified\n");
+			if (!*optarg) {
+				printf("ERROR: UDID must not be empty!\n");
 				print_usage(argc, argv);
 				exit(2);
 			}
+			udid = strdup(optarg);
 			break;
 		case 'l':
 			cmd = CMD_LIST_APPS;
@@ -489,11 +481,6 @@ static void parse_opts(int argc, char **argv)
 			appid = strdup(optarg);
 			break;
 		case 'U':
-			if (str_is_udid(optarg) == 0) {
-				fprintf(stderr, "WARNING: Using \"-U\" for \"--udid\" is deprecated. Please use \"-u\" instead.\n");
-				udid = strdup(optarg);
-				break;
-			}
 			cmd = CMD_UNINSTALL;
 			appid = strdup(optarg);
 			break;
@@ -527,6 +514,9 @@ static void parse_opts(int argc, char **argv)
 				strcat(newopts, optarg);
 				options = newopts;
 			}
+			break;
+		case 'n':
+			use_notifier = 1;
 			break;
 		case 'd':
 			idevice_set_debug_level(1);
@@ -580,7 +570,7 @@ static int afc_upload_file(afc_client_t afc, const char* filename, const char* d
 				total += written;
 			}
 			if (total != amount) {
-				fprintf(stderr, "Error: wrote only %d of %zu\n", total, amount);
+				fprintf(stderr, "Error: wrote only %u of %u\n", total, (uint32_t)amount);
 				afc_file_close(afc, af);
 				fclose(f);
 				return -1;
@@ -644,7 +634,7 @@ static void afc_upload_dir(afc_client_t afc, const char* path, const char* afcpa
 
 int main(int argc, char **argv)
 {
-	idevice_t phone = NULL;
+	idevice_t device = NULL;
 	lockdownd_client_t client = NULL;
 	instproxy_client_t ipc = NULL;
 	instproxy_error_t err;
@@ -654,46 +644,58 @@ int main(int argc, char **argv)
 	int res = 0;
 	char *bundleidentifier = NULL;
 
+#ifndef WIN32
+	signal(SIGPIPE, SIG_IGN);
+#endif
 	parse_opts(argc, argv);
 
 	argc -= optind;
 	argv += optind;
 
-	if (IDEVICE_E_SUCCESS != idevice_new(&phone, udid)) {
+	if (IDEVICE_E_SUCCESS != idevice_new(&device, udid)) {
 		fprintf(stderr, "No iOS device found, is it plugged in?\n");
 		return -1;
 	}
 
-	if (LOCKDOWN_E_SUCCESS != lockdownd_client_new_with_handshake(phone, &client, "ideviceinstaller")) {
+	if (!udid) {
+		idevice_get_udid(device, &udid);
+	}
+
+	if (LOCKDOWN_E_SUCCESS != lockdownd_client_new_with_handshake(device, &client, "ideviceinstaller")) {
 		fprintf(stderr, "Could not connect to lockdownd. Exiting.\n");
+		res = -1;
 		goto leave_cleanup;
 	}
 
-	if ((lockdownd_start_service
-		 (client, "com.apple.mobile.notification_proxy",
-		  &service) != LOCKDOWN_E_SUCCESS) || !service) {
-		fprintf(stderr,
-				"Could not start com.apple.mobile.notification_proxy!\n");
-		goto leave_cleanup;
+	if (use_notifier) {
+		if ((lockdownd_start_service
+			 (client, "com.apple.mobile.notification_proxy",
+			  &service) != LOCKDOWN_E_SUCCESS) || !service) {
+			fprintf(stderr,
+					"Could not start com.apple.mobile.notification_proxy!\n");
+			res = -1;
+			goto leave_cleanup;
+		}
+
+		np_error_t nperr = np_client_new(device, service, &np);
+
+		if (service) {
+			lockdownd_service_descriptor_free(service);
+		}
+		service = NULL;
+
+		if (nperr != NP_E_SUCCESS) {
+			fprintf(stderr, "Could not connect to notification_proxy!\n");
+			res = -1;
+			goto leave_cleanup;
+		}
+
+		np_set_notify_callback(np, notifier, NULL);
+
+		const char *noties[3] = { NP_APP_INSTALLED, NP_APP_UNINSTALLED, NULL };
+
+		np_observe_notifications(np, noties);
 	}
-
-	np_error_t nperr = np_client_new(phone, service, &np);
-
-	if (service) {
-		lockdownd_service_descriptor_free(service);
-	}
-	service = NULL;
-
-	if (nperr != NP_E_SUCCESS) {
-		fprintf(stderr, "Could not connect to notification_proxy!\n");
-		goto leave_cleanup;
-	}
-
-	np_set_notify_callback(np, notifier, NULL);
-
-	const char *noties[3] = { NP_APP_INSTALLED, NP_APP_UNINSTALLED, NULL };
-
-	np_observe_notifications(np, noties);
 
 run_again:
 	if (service) {
@@ -705,10 +707,11 @@ run_again:
 		  &service) != LOCKDOWN_E_SUCCESS) || !service) {
 		fprintf(stderr,
 				"Could not start com.apple.mobile.installation_proxy!\n");
+		res = -1;
 		goto leave_cleanup;
 	}
 
-	err = instproxy_client_new(phone, service, &ipc);
+	err = instproxy_client_new(device, service, &ipc);
 
 	if (service) {
 		lockdownd_service_descriptor_free(service);
@@ -717,15 +720,15 @@ run_again:
 
 	if (err != INSTPROXY_E_SUCCESS) {
 		fprintf(stderr, "Could not connect to installation_proxy!\n");
+		res = -1;
 		goto leave_cleanup;
 	}
 
 	setbuf(stdout, NULL);
 
-	if (last_status) {
-		free(last_status);
-		last_status = NULL;
-	}
+	free(last_status);
+	last_status = NULL;
+
 	notification_expected = 0;
 
 	if (cmd == CMD_LIST_APPS) {
@@ -770,6 +773,7 @@ run_again:
 			if (!apps || (plist_get_node_type(apps) != PLIST_ARRAY)) {
 				fprintf(stderr,
 						"ERROR: instproxy_browse returnd an invalid plist!\n");
+				res = -1;
 				goto leave_cleanup;
 			}
 
@@ -795,6 +799,7 @@ run_again:
 		instproxy_client_options_free(client_opts);
 		if (err != INSTPROXY_E_SUCCESS) {
 			fprintf(stderr, "ERROR: instproxy_browse returned %d\n", err);
+			res = -1;
 			goto leave_cleanup;
 		}
 
@@ -808,27 +813,28 @@ run_again:
 		uint64_t af = 0;
 		char buf[8192];
 
-		if (service) {
-			lockdownd_service_descriptor_free(service);
-		}
+		lockdownd_service_descriptor_free(service);
 		service = NULL;
 
 		if ((lockdownd_start_service(client, "com.apple.afc", &service) !=
 			 LOCKDOWN_E_SUCCESS) || !service) {
 			fprintf(stderr, "Could not start com.apple.afc!\n");
+			res = -1;
 			goto leave_cleanup;
 		}
 
 		lockdownd_client_free(client);
 		client = NULL;
 
-		if (afc_client_new(phone, service, &afc) != AFC_E_SUCCESS) {
+		if (afc_client_new(device, service, &afc) != AFC_E_SUCCESS) {
 			fprintf(stderr, "Could not connect to AFC!\n");
+			res = -1;
 			goto leave_cleanup;
 		}
 
 		if (stat(appid, &fst) != 0) {
 			fprintf(stderr, "ERROR: stat: %s: %s\n", appid, strerror(errno));
+			res = -1;
 			goto leave_cleanup;
 		}
 
@@ -857,6 +863,7 @@ run_again:
 			zf = zip_open(appid, 0, &errp);
 			if (!zf) {
 				fprintf(stderr, "ERROR: zip_open: %s: %d\n", appid, errp);
+				res = -1;
 				goto leave_cleanup;
 			}
 
@@ -907,7 +914,7 @@ run_again:
 					dstpath = NULL;
 
 					zip_uint64_t zfsize = 0;
-					while (zfsize < (zip_uint64_t)zs.size) {
+					while (zfsize < zs.size) {
 						zip_int64_t amount = zip_fread(zfile, buf, sizeof(buf));
 						if (amount == 0) {
 							break;
@@ -929,6 +936,7 @@ run_again:
 								afc_file_close(afc, af);
 								zip_fclose(zfile);
 								free(dstpath);
+								res = -1;
 								goto leave_cleanup;
 							}
 						}
@@ -952,16 +960,67 @@ run_again:
 
 			if (asprintf(&pkgname, "%s/%s", PKG_PATH, basename(appid)) < 0) {
 				fprintf(stderr, "ERROR: Out of memory allocating pkgname!?\n");
+				res = -1;
 				goto leave_cleanup;
 			}
 
 			printf("Uploading %s package contents... ", basename(appid));
 			afc_upload_dir(afc, appid, pkgname);
 			printf("DONE.\n");
+
+			/* extract the CFBundleIdentifier from the package */
+
+			/* construct full filename to Info.plist */
+			char *filename = (char*)malloc(strlen(appid)+11+1);
+			strcpy(filename, appid);
+			strcat(filename, "/Info.plist");
+
+			struct stat st;
+			FILE *fp = NULL;
+
+			if (stat(filename, &st) == -1 || (fp = fopen(filename, "r")) == NULL) {
+				fprintf(stderr, "ERROR: could not locate %s in app!\n", filename);
+				free(filename);
+				res = -1;
+				goto leave_cleanup;
+			}
+			size_t filesize = st.st_size;
+			char *ibuf = malloc(filesize * sizeof(char));
+			size_t amount = fread(ibuf, 1, filesize, fp);
+			if (amount != filesize) {
+				fprintf(stderr, "ERROR: could not read %u bytes from %s\n", (uint32_t)filesize, filename);
+				free(filename);
+				res = -1;
+				goto leave_cleanup;
+			}
+			fclose(fp);
+			free(filename);
+
+			plist_t info = NULL;
+			if (memcmp(ibuf, "bplist00", 8) == 0) {
+				plist_from_bin(ibuf, filesize, &info);
+			} else {
+				plist_from_xml(ibuf, filesize, &info);
+			}
+			free(ibuf);
+
+			if (!info) {
+				fprintf(stderr, "ERROR: could not parse Info.plist!\n");
+				res = -1;
+				goto leave_cleanup;
+			}
+
+			plist_t bname = plist_dict_get_item(info, "CFBundleIdentifier");
+			if (bname) {
+				plist_get_string_val(bname, &bundleidentifier);
+			}
+			plist_free(info);
+			info = NULL;
 		} else {
 			zf = zip_open(appid, 0, &errp);
 			if (!zf) {
 				fprintf(stderr, "ERROR: zip_open: %s: %d\n", appid, errp);
+				res = -1;
 				goto leave_cleanup;
 			}
 
@@ -979,9 +1038,7 @@ run_again:
 			} else {
 				fprintf(stderr, "WARNING: could not locate %s in archive!\n", ITUNES_METADATA_PLIST_FILENAME);
 			}
-			if (zbuf) {
-				free(zbuf);
-			}
+			free(zbuf);
 
 			/* determine .app directory in archive */
 			zbuf = NULL;
@@ -992,6 +1049,7 @@ run_again:
 
 			if (zip_get_app_directory(zf, &app_directory_name)) {
 				fprintf(stderr, "Unable to locate app directory in archive!\n");
+				res = -1;
 				goto leave_cleanup;
 			}
 
@@ -1007,6 +1065,7 @@ run_again:
 				free(filename);
 				zip_unchange_all(zf);
 				zip_close(zf);
+				res = -1;
 				goto leave_cleanup;
 			}
 			free(filename);
@@ -1021,6 +1080,7 @@ run_again:
 				fprintf(stderr, "Could not parse Info.plist!\n");
 				zip_unchange_all(zf);
 				zip_close(zf);
+				res = -1;
 				goto leave_cleanup;
 			}
 
@@ -1042,12 +1102,14 @@ run_again:
 				fprintf(stderr, "Could not determine value for CFBundleExecutable!\n");
 				zip_unchange_all(zf);
 				zip_close(zf);
+				res = -1;
 				goto leave_cleanup;
 			}
 
 			char *sinfname = NULL;
 			if (asprintf(&sinfname, "Payload/%s.app/SC_Info/%s.sinf", bundleexecutable, bundleexecutable) < 0) {
 				fprintf(stderr, "Out of memory!?\n");
+				res = -1;
 				goto leave_cleanup;
 			}
 			free(bundleexecutable);
@@ -1061,14 +1123,13 @@ run_again:
 				fprintf(stderr, "WARNING: could not locate %s in archive!\n", sinfname);
 			}
 			free(sinfname);
-			if (zbuf) {
-				free(zbuf);
-			}
+			free(zbuf);
 
 			/* copy archive to device */
 			pkgname = NULL;
 			if (asprintf(&pkgname, "%s/%s", PKG_PATH, bundleidentifier) < 0) {
 				fprintf(stderr, "Out of memory!?\n");
+				res = -1;
 				goto leave_cleanup;
 			}
 
@@ -1132,12 +1193,14 @@ run_again:
 		err = instproxy_lookup_archives(ipc, NULL, &dict);
 		if (err != INSTPROXY_E_SUCCESS) {
 			fprintf(stderr, "ERROR: lookup_archives returned %d\n", err);
+			res = -1;
 			goto leave_cleanup;
 		}
 
 		if (!dict) {
 			fprintf(stderr,
 					"ERROR: lookup_archives did not return a plist!?\n");
+			res = -1;
 			goto leave_cleanup;
 		}
 
@@ -1243,12 +1306,14 @@ run_again:
 			if (stat(copy_path, &fst) != 0) {
 				fprintf(stderr, "ERROR: stat: %s: %s\n", copy_path, strerror(errno));
 				free(copy_path);
+				res = -1;
 				goto leave_cleanup;
 			}
 
 			if (!S_ISDIR(fst.st_mode)) {
 				fprintf(stderr, "ERROR: '%s' is not a directory as expected.\n", copy_path);
 				free(copy_path);
+				res = -1;
 				goto leave_cleanup;
 			}
 
@@ -1260,14 +1325,16 @@ run_again:
 			if ((lockdownd_start_service(client, "com.apple.afc", &service) != LOCKDOWN_E_SUCCESS) || !service) {
 				fprintf(stderr, "Could not start com.apple.afc!\n");
 				free(copy_path);
+				res = -1;
 				goto leave_cleanup;
 			}
 
 			lockdownd_client_free(client);
 			client = NULL;
 
-			if (afc_client_new(phone, service, &afc) != AFC_E_SUCCESS) {
+			if (afc_client_new(device, service, &afc) != AFC_E_SUCCESS) {
 				fprintf(stderr, "Could not connect to AFC!\n");
+				res = -1;
 				goto leave_cleanup;
 			}
 		}
@@ -1288,6 +1355,7 @@ run_again:
 			if (err_occurred) {
 				afc_client_free(afc);
 				afc = NULL;
+				res = -1;
 				goto leave_cleanup;
 			}
 			FILE *f = NULL;
@@ -1296,6 +1364,7 @@ run_again:
 			char *localfile = NULL;
 			if (asprintf(&localfile, "%s/%s.ipa", copy_path, appid) < 0) {
 				fprintf(stderr, "Out of memory!?\n");
+				res = -1;
 				goto leave_cleanup;
 			}
 			free(copy_path);
@@ -1321,6 +1390,7 @@ run_again:
 				fclose(f);
 				free(remotefile);
 				free(localfile);
+				res = -1;
 				goto leave_cleanup;
 			}
 
@@ -1351,6 +1421,7 @@ run_again:
 				fprintf(stderr, "ERROR: could not open '%s' on device for reading!\n", remotefile);
 				free(remotefile);
 				free(localfile);
+				res = -1;
 				goto leave_cleanup;
 			}
 
@@ -1398,8 +1469,9 @@ run_again:
 				cmd = CMD_REMOVE_ARCHIVE;
 				free(options);
 				options = NULL;
-				if (LOCKDOWN_E_SUCCESS != lockdownd_client_new_with_handshake(phone, &client, "ideviceinstaller")) {
+				if (LOCKDOWN_E_SUCCESS != lockdownd_client_new_with_handshake(device, &client, "ideviceinstaller")) {
 					fprintf(stderr, "Could not connect to lockdownd. Exiting.\n");
+					res = -1;
 					goto leave_cleanup;
 				}
 				goto run_again;
@@ -1420,41 +1492,23 @@ run_again:
 		goto leave_cleanup;
 	}
 
-	if (client) {
-		/* not needed anymore */
-		lockdownd_client_free(client);
-		client = NULL;
-	}
+	/* not needed anymore */
+	lockdownd_client_free(client);
+	client = NULL;
 
 	idevice_wait_for_command_to_complete();
 
 leave_cleanup:
-	if (bundleidentifier) {
-		free(bundleidentifier);
-	}
-	if (np) {
-		np_client_free(np);
-	}
-	if (ipc) {
-		instproxy_client_free(ipc);
-	}
-	if (afc) {
-		afc_client_free(afc);
-	}
-	if (client) {
-		lockdownd_client_free(client);
-	}
-	idevice_free(phone);
+	np_client_free(np);
+	instproxy_client_free(ipc);
+	afc_client_free(afc);
+	lockdownd_client_free(client);
+	idevice_free(device);
 
-	if (udid) {
-		free(udid);
-	}
-	if (appid) {
-		free(appid);
-	}
-	if (options) {
-		free(options);
-	}
+	free(udid);
+	free(appid);
+	free(options);
+	free(bundleidentifier);
 
 	if (err_occurred && !res) {
 		res = 128;
